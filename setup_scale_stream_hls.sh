@@ -276,6 +276,7 @@ echo "    Components:   scale=$DO_SCALE stream=$DO_STREAM  force_full=$FORCE_FUL
 echo ""
 
 ensure_dir "$INSTALL_ROOT"
+INSTALL_ROOT="$(cd "$INSTALL_ROOT" && pwd)"
 cd "$INSTALL_ROOT" || die "cannot cd to $INSTALL_ROOT"
 
 maybe_sudo_prompt
@@ -362,6 +363,7 @@ fi
 if [[ "$DO_STREAM" -eq 1 ]]; then
     echo "========== Stream-HLS =========="
     STREAM_DIR="$INSTALL_ROOT/Stream-HLS"
+    LLVM_DIR="$STREAM_DIR/extern/llvm-project"
 
     ensure_conda_for_streamhls
 
@@ -379,14 +381,32 @@ if [[ "$DO_STREAM" -eq 1 ]]; then
         git -C "$STREAM_DIR" submodule update --init --recursive
     fi
 
+    # Patch Stream-HLS source before configure so CMake sees the dependency
+    # in the same run that generates build files.
+    SUPPORT_CMAKE="$STREAM_DIR/lib/Support/CMakeLists.txt"
+    if [[ -f "$SUPPORT_CMAKE" ]]; then
+        if ! grep -q "MLIRDataflowIncGen" "$SUPPORT_CMAKE" 2>/dev/null; then
+            echo "[streamhls] Patching $SUPPORT_CMAKE to depend on Dataflow inc generation."
+            sed -i '/${globbed}/a \\  DEPENDS\n\\  MLIRDataflowIncGen\n\\  MLIRDataflowAttributesIncGen\n\\  MLIRDataflowInterfacesIncGen' "$SUPPORT_CMAKE" || die "Failed to patch $SUPPORT_CMAKE"
+        fi
+    fi
+
     cd "$STREAM_DIR" || die "cd Stream-HLS"
 
     if [[ ! -d "ampl.linux-intel64" ]]; then
         echo "[streamhls] Downloading AMPL bundle..."
-        download_file "$AMPL_BOX_URL" "$STREAM_DIR/ampl_package.tar.gz"
-        tar -xzf "$STREAM_DIR/ampl_package.tar.gz" -C "$STREAM_DIR" || die "extract AMPL failed"
-        rm -f "$STREAM_DIR/ampl_package.tar.gz"
-        [[ -d "$STREAM_DIR/ampl.linux-intel64" ]] || die "AMPL directory missing after extract"
+        if command -v wget >/dev/null 2>&1; then
+            wget -O ampl_package.tar.gz "$AMPL_BOX_URL" || die "wget failed to download AMPL: $AMPL_BOX_URL"
+        elif command -v curl >/dev/null 2>&1; then
+            curl -fL -o ampl_package.tar.gz "$AMPL_BOX_URL" || die "curl failed to download AMPL: $AMPL_BOX_URL"
+        else
+            die "Need wget or curl to download AMPL bundle."
+        fi
+        
+        tar -xzf ampl_package.tar.gz || die "Failed to extract AMPL bundle"
+        rm -f ampl_package.tar.gz
+        [[ -d "ampl.linux-intel64" ]] || die "AMPL directory missing after extraction"
+        echo "[streamhls] AMPL bundle downloaded and extracted successfully."
     else
         echo "[streamhls] ampl.linux-intel64 already present."
     fi
@@ -394,38 +414,56 @@ if [[ "$DO_STREAM" -eq 1 ]]; then
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 
-    sed -i 's|conda create -n streamhls python=3.11|conda create -n streamhls python=3.11 -y|' setup-env.sh
-
-    # Match existing codesign flow: parallelize LLVM + Stream-HLS builds.
-    sed -i 's|cmake --build \. --target check-mlir|cmake --build . --target check-mlir -- -j$(nproc)|' build-llvm.sh
-    sed -i 's|make$|make -j $(nproc)|' build-streamhls.sh
-
-    # shellcheck source=/dev/null
-    source setup-env.sh
-
-    if [[ "$FORCE_FULL" -eq 1 ]]; then
-        echo "[streamhls] Building LLVM/MLIR (long) ..."
-        # shellcheck source=/dev/null
-        source build-llvm.sh
-        echo "[streamhls] Building Stream-HLS ..."
-        # shellcheck source=/dev/null
-        source build-streamhls.sh
-    elif [[ -f "$STREAM_DIR/build/bin/streamhls-opt" ]]; then
-        echo "[streamhls] streamhls-opt already present; skipping LLVM/Stream-HLS compile (use --full to rebuild)."
-    elif [[ -f "$STREAM_DIR/extern/llvm-project/build/CMakeCache.txt" ]]; then
-        echo "[streamhls] LLVM/MLIR build tree found; building Stream-HLS only ..."
-        # shellcheck source=/dev/null
-        source build-streamhls.sh
+    if [[ "$FORCE_FULL" -eq 1 ]] || [[ ! -f "$LLVM_DIR/build/CMakeCache.txt" ]]; then
+        echo "[streamhls] Building LLVM/MLIR in extern/llvm-project ..."
+        mkdir -p "$LLVM_DIR/build" || die "cannot create LLVM build dir"
+        LLVM_CMAKE_GENERATOR="Unix Makefiles"
+        if command -v ninja >/dev/null 2>&1; then
+            LLVM_CMAKE_GENERATOR="Ninja"
+        fi
+        LLVM_CC="$(command -v clang 2>/dev/null || true)"
+        LLVM_CXX="$(command -v clang++ 2>/dev/null || true)"
+        if [[ -z "$LLVM_CC" || -z "$LLVM_CXX" ]]; then
+            die "clang and clang++ are required to build LLVM/MLIR"
+        fi
+        ( cd "$LLVM_DIR/build" && cmake -G "$LLVM_CMAKE_GENERATOR" ../llvm \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLLVM_ENABLE_ASSERTIONS=ON \
+            -DCMAKE_C_COMPILER="$LLVM_CC" \
+            -DCMAKE_CXX_COMPILER="$LLVM_CXX" \
+            -DCMAKE_ASM_COMPILER="$LLVM_CC" \
+            -DLLVM_ENABLE_LLD=ON \
+            -DLLVM_INSTALL_UTILS=ON \
+          && if [[ "$LLVM_CMAKE_GENERATOR" == "Ninja" ]]; then \
+                cmake --build . --target check-mlir -j"$JOBS"; \
+             else \
+                cmake --build . --target check-mlir -- -j"$JOBS"; \
+             fi ) || die "LLVM/MLIR build failed"
     else
-        echo "[streamhls] Building LLVM/MLIR (long) ..."
-        # shellcheck source=/dev/null
-        source build-llvm.sh
-        echo "[streamhls] Building Stream-HLS ..."
-        # shellcheck source=/dev/null
-        source build-streamhls.sh
+        echo "[streamhls] LLVM/MLIR build tree found; skipping LLVM rebuild (use --full to rebuild)."
     fi
 
-    cd "$INSTALL_ROOT" || true
+    if [[ "$FORCE_FULL" -eq 1 ]] || [[ ! -f "$STREAM_DIR/build/CMakeCache.txt" ]]; then
+        echo "[streamhls] Configuring Stream-HLS ..."
+        ( cd "$STREAM_DIR" && bash ./build-streamhls.sh "$LLVM_DIR" ) || die "Stream-HLS configure failed"
+    else
+        echo "[streamhls] Stream-HLS build tree found; reusing existing configuration (use --full to reconfigure)."
+    fi
+
+    # Force-generate Dataflow tablegen outputs before the full build so the
+    # generated header streamhls/Dialect/Dataflow/DataflowDialect.h.inc exists.
+    echo "[streamhls] Generating Dataflow TableGen headers ..."
+    ( cd "$STREAM_DIR/build" && cmake --build . \
+        --target MLIRDataflowIncGen MLIRDataflowAttributesIncGen MLIRDataflowInterfacesIncGen \
+        -- -j"$JOBS" ) || die "Stream-HLS Dataflow tablegen generation failed"
+
+    if [[ "$FORCE_FULL" -eq 1 ]] || [[ ! -x "$STREAM_DIR/build/bin/streamhls-opt" ]]; then
+        echo "[streamhls] Building Stream-HLS ..."
+        ( cd "$STREAM_DIR/build" && cmake --build . -- -j"$JOBS" ) || die "Stream-HLS build failed"
+    else
+        echo "[streamhls] streamhls-opt already present; skipping Stream-HLS compile (use --full to rebuild)."
+    fi
 
     if [[ -z "$AMPL_UUID" ]] && [[ -t 0 ]] && [[ -r /dev/tty ]]; then
         echo -n "Enter AMPL license UUID (optional, press Enter to skip): " >/dev/tty
@@ -433,12 +471,17 @@ if [[ "$DO_STREAM" -eq 1 ]]; then
     fi
 
     if [[ -n "$AMPL_UUID" ]]; then
-        echo "[streamhls] Activating AMPL license..."
-        ( cd "$STREAM_DIR/ampl.linux-intel64" && ./ampl <<EOF
+        if [[ -d "$STREAM_DIR/ampl.linux-intel64" ]]; then
+            echo "[streamhls] Activating AMPL license..."
+            ( cd "$STREAM_DIR/ampl.linux-intel64" && ./ampl <<EOF
 shell "amplkey activate --uuid $AMPL_UUID";
 exit;
 EOF
-        ) || echo "[streamhls] AMPL activation reported an error; you can run ampl manually later."
+            ) || echo "[streamhls] AMPL activation reported an error; you can run ampl manually later."
+        else
+            echo "[streamhls] WARNING: Cannot activate AMPL UUID; AMPL directory not found."
+            echo "[streamhls] If you have AMPL, manually extract it to $STREAM_DIR/ampl.linux-intel64 and activate."
+        fi
     else
         echo "[streamhls] Skipped AMPL UUID activation (pass --ampl-uuid or enter when prompted)."
     fi
