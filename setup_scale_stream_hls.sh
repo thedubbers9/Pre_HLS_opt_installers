@@ -9,6 +9,8 @@
 #   ./setup_scale_stream_hls.sh [--prefix DIR] [--all|--scalehls|--streamhls]
 #       [--full] [--gui] [--jobs N] [--ampl-uuid UUID]
 #
+# Simplest install command: ./setup_scale_stream_hls --all --full --ampl-uuid <your UUID>
+# 
 # Environment:
 #   INSTALL_ROOT   Same as --prefix (default: ./hls_toolchain)
 #   SCALEHLS_REPO  Override ScaleHLS git URL
